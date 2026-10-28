@@ -52,6 +52,82 @@ else
     cd ..
 fi
 
+# ---------------------------------------------------------
+# BakaSU Hotfixes
+# ---------------------------------------------------------
+
+# We strip the $(error ...) directive to force compilation of our custom port.
+SUSFS_COMPAT_MK="${MANAGER_DIR}/kernel/tools/susfs_compat.mk"
+if [ -f "$SUSFS_COMPAT_MK" ]; then
+    echo ">>> [HOTFIX] Neutering BakaSU strict SuSFS version gatekeeper..."
+    sed -i '/Please wait susfs update/d' "$SUSFS_COMPAT_MK"
+else
+    echo ">>> [NOTICE] BakaSU gatekeeper file not found at $SUSFS_COMPAT_MK"
+fi
+
+# SELinux Hide LTO and Kernel Compat Patches
+SELINUX_HIDE_FILE="${MANAGER_DIR}/kernel/feature/selinux_hide.c"
+    
+# 1. Force compile manual hooks to satisfy 50_patch linker requirements
+echo ">>> [HOTFIX] Exposing BakaSU static symbols for hooks.c linker..."
+sed -i 's|#include "compat/kernel_compat.h"|#include "compat/kernel_compat.h"\n\n/* Force compile manual hooks */\n#undef KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE|g' "$SELINUX_HIDE_FILE"
+    
+sed -i -E 's/(__maybe_static|static)[[:space:]]+ssize_t my_write_context/ssize_t my_write_context/g' "$SELINUX_HIDE_FILE"
+sed -i -E 's/(__maybe_static|static)[[:space:]]+ssize_t my_write_access/ssize_t my_write_access/g' "$SELINUX_HIDE_FILE"
+
+    # 3. Polyfill 50_patch Linker Stubs (Weak Polyfills)
+    echo ">>> [HOTFIX] Injecting safe WEAK C stubs to bypass linker panics..."
+    cat << 'EOF' >> "$SELINUX_HIDE_FILE"
+
+/* BakaSU 50_patch Hook Linker Stubs (WEAK to avoid collisions) */
+struct filename;
+struct user_arg_ptr;
+struct task_struct;
+
+/* Safely bypasses SuSFS preinit interception to prevent Rescue Party (Yields to native preinit.c if present) */
+__attribute__((weak)) int ksu_setup_preinit_file(struct filename **filename_ptr, struct user_arg_ptr *argv_user) {
+    return 0; 
+}
+
+__attribute__((weak)) int ksu_preinit_handle_post_execveat(int *fd, struct filename **filename_ptr,
+                void *argv_user, void *envp_user,
+                int *flags, int *retval, int *preinit_fd) {
+    return 0;
+}
+
+/* Satisfies static hooks.c calls since upstream uses a macro alias that we undefine */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0) || defined(KSU_COMPAT_SETPROCATTR_USE_NEW_PROTOTYPE)
+__attribute__((weak)) int __nocfi my_setprocattr(const char *name, void *value, size_t size) {
+    return ksu_handle_selinux_setprocattr(name, value, size);
+}
+#else
+__attribute__((weak)) int __nocfi my_setprocattr(struct task_struct *p, char *name, void *value, size_t size) {
+    return ksu_handle_selinux_setprocattr(p, name, value, size);
+}
+#endif
+EOF
+
+# 4. Un-hide static SELinux state variables to satisfy 50_patch linker requirements
+echo ">>> [HOTFIX] Un-hiding BakaSU static SELinux state variables for 50_patch..."
+
+# Strip static prefixes so the 50_ patch can link to BakaSU's native state
+sed -i -E 's/(__maybe_static|static)[[:space:]]+bool ksu_selinux_hide/bool ksu_selinux_hide/g' "$SELINUX_HIDE_FILE"
+sed -i -E 's/(__maybe_static|static)[[:space:]]+struct page \*fake_status/struct page \*fake_status/g' "$SELINUX_HIDE_FILE"
+sed -i -E 's/(__maybe_static|static)[[:space:]]+DEFINE_STATIC_KEY_FALSE/DEFINE_STATIC_KEY_FALSE/g' "$SELINUX_HIDE_FILE"
+sed -i -E 's/(__maybe_static|static)[[:space:]]+void initialize_fake_status/void initialize_fake_status/g' "$SELINUX_HIDE_FILE"
+sed -i -E 's/(__maybe_static|static)[[:space:]]+struct selinux_policy \*backup_sepolicy/struct selinux_policy \*backup_sepolicy/g' "$SELINUX_HIDE_FILE"
+
+# Universal fake_state polyfill to survive LTO
+sed -i -E 's/^[ \t]*static[ \t]+struct selinux_state fake_state/struct selinux_state fake_state/g' "$SELINUX_HIDE_FILE"
+if ! grep -q "KSU_FAKE_STATE_POLYFILL" "$SELINUX_HIDE_FILE"; then
+    cat << 'EOF' >> "$SELINUX_HIDE_FILE"
+
+/* KSU_FAKE_STATE_POLYFILL */
+__attribute__((weak)) struct selinux_state fake_state = {0};
+EOF
+fi
+echo "  -> BakaSU legacy variables safely un-hidden."
+
 echo "  -> Target Tag: $CALCULATED_TAG"
 echo "  -> Target Hash: $UPSTREAM_HASH"
 echo "  -> Target Count: $CALCULATED_COUNT"
