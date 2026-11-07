@@ -7,7 +7,7 @@ on:
         description: 'Build Channel'
         required: false
         type: choice
-        options: 
+        options:
           - stable
           - dynamic 
           - main
@@ -56,7 +56,24 @@ on:
         description: "Full OTA ZIP URL (blank produces AK3 zip)"
         required: false
         type: string
+        
+      custom_uname_r:
+        description: |
+          Custom uname -r
+          <example>  6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+          (Leave blank for repo default)
+        required: false
+        type: string
+        default: ''
 
+      custom_uname_v:
+        description: |
+          Custom uname -v
+          <example>  #1 SMP PREEMPT Thu Sep  3 03:59:00 UTC 2026
+          (Leave blank for repo default)
+        required: false
+        type: string
+        default: ''
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   MANIFEST_URL: https://android.googlesource.com/kernel/manifest
@@ -266,12 +283,38 @@ jobs:
             fi
           done
 
-          # Capture the PURE Google hash AND the official Unix timestamp
+          # Capture the PURE Google hash AND the official Unix timestamp (or apply user overrides)
           cd common
-          echo "OFFICIAL_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          echo "OFFICIAL_DATE=$(git log -1 --format=%ct)" >> $GITHUB_ENV
-          echo ">>> Captured Hash: $(git rev-parse --short HEAD)"
-          echo ">>> Captured Date: $(git log -1 --format=%ct)"
+
+          INPUT_R="${{ inputs.custom_uname_r }}"
+          INPUT_V="${{ inputs.custom_uname_v }}"
+
+          if [ -n "$INPUT_R" ]; then
+            # Strip any leading/trailing whitespace and extract everything after '-g' (preserving -abXXXX)
+            CLEAN_HASH=$(echo "$INPUT_R" | xargs | sed -E 's/^.*-g([0-9a-fA-F]+.*)$/\1/; s/^g([0-9a-fA-F]+)/\1/')
+            echo "OFFICIAL_HASH=$CLEAN_HASH" >> $GITHUB_ENV
+            echo ">>> [OVERRIDE] Using Custom Release Suffix: -g$CLEAN_HASH"
+          else
+            DEFAULT_HASH=$(git rev-parse --short=12 HEAD)
+            echo "OFFICIAL_HASH=$DEFAULT_HASH" >> $GITHUB_ENV
+            echo ">>> Captured Default Hash: $DEFAULT_HASH"
+          fi
+
+          if [ -n "$INPUT_V" ]; then
+            # Strip '#1 SMP PREEMPT ' prefix if full uname -v was pasted
+            CLEAN_DATE_STR=$(echo "$INPUT_V" | sed -E 's/^#[0-9]+[[:space:]]+(SMP[[:space:]]+)?(PREEMPT(_DYNAMIC|_RT)?[[:space:]]+)?//')
+            if [[ "$CLEAN_DATE_STR" =~ ^[0-9]+$ ]]; then
+              CUSTOM_EPOCH="$CLEAN_DATE_STR"
+            else
+              CUSTOM_EPOCH=$(date -u -d "$CLEAN_DATE_STR" +%s)
+            fi
+            echo "OFFICIAL_DATE=$CUSTOM_EPOCH" >> $GITHUB_ENV
+            echo ">>> [OVERRIDE] Using Custom Date: $CLEAN_DATE_STR (Epoch: $CUSTOM_EPOCH)"
+          else
+            DEFAULT_DATE=$(git log -1 --format=%ct)
+            echo "OFFICIAL_DATE=$DEFAULT_DATE" >> $GITHUB_ENV
+            echo ">>> Captured Default Date: $DEFAULT_DATE"
+          fi
 
       - name: Calculate Dynamic SuSFS Branch
         if: inputs.root_manager != 'Stock' && inputs.enable_ksu_susfs == true
@@ -291,7 +334,40 @@ jobs:
               echo "[-] Warning: MANIFEST_BRANCH not found. Falling back to default."
               echo "SUSFS_BRANCH=gki-android14-6.1-dev" >> $GITHUB_ENV
           fi
-
+          
+      - name: Resolve Upstream Hash and Artifacts
+        # Restrict this step to ONLY run on dynamic or main channels
+        if: inputs.root_manager != 'Stock' && inputs.root_manager != 'ReSukiSU' && (inputs.build_channel == 'dynamic' || inputs.build_channel == 'main')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo ">>> Dynamic Channel: Hunting for latest valid run in $UPSTREAM_REPO..."
+          RUNS_JSON=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM_REPO/actions/workflows/$WORKFLOW_FILE/runs?branch=$TARGET_BRANCH&status=success&per_page=15")
+          RUN_DATA=$(echo "$RUNS_JSON" | jq -r '.workflow_runs[]? | "\(.id)|\(.head_sha)"')
+          
+          for ENTRY in $RUN_DATA; do
+              RUN_ID=$(echo "$ENTRY" | cut -d'|' -f1)
+              SHA=$(echo "$ENTRY" | cut -d'|' -f2)
+              
+              ARTIFACTS_JSON=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$UPSTREAM_REPO/actions/runs/$RUN_ID/artifacts")
+              VALID_ARTIFACTS=$(echo "$ARTIFACTS_JSON" | jq -r '[.artifacts[]? | select(.name | test("(?i)(manager|kernelsu[_-]v|bakasu|sukisu)")) | select(.name | test("(?i)(debug|mappings|gradle|armeabi-v7a|universal|x86_64|riscv64)") | not) | select(.expired == false)] | length')
+              
+              if [ "$VALID_ARTIFACTS" -gt 0 ]; then
+                  echo ">>> SUCCESS! Found valid artifacts on Run ID: $RUN_ID (SHA: ${SHA:0:7})"
+                  UPSTREAM_HASH="$SHA"
+                  
+                  echo "UPSTREAM_HASH=$SHA" >> $GITHUB_ENV
+                  echo "UPSTREAM_RUN_ID=$RUN_ID" >> $GITHUB_ENV
+                  break
+              fi
+          done
+          
+          if [ -z "${UPSTREAM_HASH:-}" ]; then
+             echo "[-] FATAL: Could not resolve a valid Upstream Hash."
+             exit 1
+          fi
+          
       - name: Integrate Root Manager (${{ inputs.root_manager }})
         if: inputs.root_manager != 'Stock' && inputs.enable_ksu_susfs == true
         env:
@@ -405,6 +481,30 @@ jobs:
           OFFICIAL_HASH=${{ env.OFFICIAL_HASH }} \
           OFFICIAL_DATE=${{ env.OFFICIAL_DATE }} \
           bash ./scripts/build_kernel.sh
+  
+      - name: Inject KernelPatch (KPM) Engine
+        if: inputs.root_manager == 'SukiSU-Ultra'
+        run: |
+          echo ">>> Fetching latest SukiSU-Ultra APK to extract kpimg core..."
+          SUKI_API="https://api.github.com/repos/SukiSU-Ultra/SukiSU-Ultra/releases/latest"
+          APK_URL=$(curl -s "$SUKI_API" | grep "browser_download_url.*\.apk" | cut -d '"' -f 4 | head -n 1)
+          wget -qO manager.apk "$APK_URL"
+          unzip -j manager.apk "assets/kpm/kpimg"
+          
+          echo ">>> Compiling Linux patcher tool from ShirkNeko source..."
+          git clone --depth 1 https://github.com/ShirkNeko/SukiSU_KernelPatch_patch.git kp_src
+          cd kp_src/tools
+          make
+          # The Makefile outputs a binary named 'kptools'
+          cp kptools ../../kp
+          cd ../../
+          chmod +x kp
+          
+          echo ">>> Patching raw kernel Image..."
+          ./kp -p -i out/Image -k kpimg -o out/Image-patched
+          mv out/Image-patched out/Image
+          
+          echo ">>> KPM Engine successfully injected into CI pipeline!"
           
       - name: Pull stock boot.img from OTA
         if: env.REPACK_ENABLED == 'true'
